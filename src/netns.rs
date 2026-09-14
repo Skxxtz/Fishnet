@@ -63,6 +63,7 @@ pub fn create(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Idempotent: a namespace that's already gone is success, not an error.
 pub fn delete(name: &str) -> Result<()> {
     use nix::mount::{MntFlags, umount2};
     let target = ns_path(name);
@@ -75,6 +76,7 @@ pub fn delete(name: &str) -> Result<()> {
             Err(_) => break,
         }
     }
+    // Best-effort: EBUSY/races here shouldn't fail teardown as a whole.
     let _ = fs::remove_file(&target);
     Ok(())
 }
@@ -152,40 +154,63 @@ pub fn exec_in(name: &str, cmd: &[String]) -> Result<()> {
 
     let mut command = Command::new(&cmd[0]);
     command.args(&cmd[1..]);
+    let cmd_needs_root = cmd[0] == "sudo";
 
+    // (1) fix the vars sudo forces to root's identity (HOME/USER/LOGNAME, MAIL) and the
+    // desktop-session vars sudo's env_reset strips (DISPLAY/XAUTHORITY/WAYLAND_DISPLAY/
+    // DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR), and (2) drop sudo's own bookkeeping vars so they
+    // don't leak into the child.
     let mut sudo_user_info: Option<(u32, u32, nix::unistd::User)> = None;
-    if let (Ok(uid_str), Ok(gid_str)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
-        let uid: u32 = uid_str.parse().context("parse SUDO_UID")?;
-        let gid: u32 = gid_str.parse().context("parse SUDO_GID")?;
+    if !cmd_needs_root {
+        if let (Ok(uid_str), Ok(gid_str)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
+            let uid: u32 = uid_str.parse().context("parse SUDO_UID")?;
+            let gid: u32 = gid_str.parse().context("parse SUDO_GID")?;
 
-        let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
-        command.env_clear();
+            if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+                let home = user.dir.display().to_string();
+                let runtime_dir = format!("/run/user/{uid}");
 
-        if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
-            let home = user.dir.display().to_string();
-            let runtime_dir = format!("/run/user/{uid}");
+                command.env("HOME", &home);
+                command.env("USER", &user.name);
+                command.env("LOGNAME", &user.name);
+                if std::env::var_os("MAIL").is_some() {
+                    command.env("MAIL", format!("/var/mail/{}", user.name));
+                }
 
-            command.env("HOME", &home);
-            command.env("USER", &user.name);
-            command.env("LOGNAME", &user.name);
-            command.env("PATH", &path);
-            command.env("XDG_RUNTIME_DIR", &runtime_dir);
-
-            let defaults = [
-                ("DISPLAY", ":0".to_string()),
-                ("XAUTHORITY", format!("{home}/.Xauthority")),
-                ("WAYLAND_DISPLAY", "wayland-0".to_string()),
-                (
+                // sudo's env_reset strips these before we ever see them, so
+                // "inherited" is indistinguishable from "unset" here — use
+                // the inherited value if present (e.g. env_keep in sudoers,
+                // or `sudo -E`), otherwise fall back to the normal per-user
+                // default so GUI apps still find a display/session bus.
+                let keep_or_default =
+                    |key: &str, default: String| std::env::var(key).unwrap_or(default);
+                command.env(
+                    "XDG_RUNTIME_DIR",
+                    keep_or_default("XDG_RUNTIME_DIR", runtime_dir.clone()),
+                );
+                command.env("DISPLAY", keep_or_default("DISPLAY", ":0".to_string()));
+                command.env(
+                    "XAUTHORITY",
+                    keep_or_default("XAUTHORITY", format!("{home}/.Xauthority")),
+                );
+                command.env(
+                    "WAYLAND_DISPLAY",
+                    keep_or_default("WAYLAND_DISPLAY", "wayland-0".to_string()),
+                );
+                command.env(
                     "DBUS_SESSION_BUS_ADDRESS",
-                    format!("unix:path={runtime_dir}/bus"),
-                ),
-            ];
-            for (key, default) in defaults {
-                let value = std::env::var(key).unwrap_or(default);
-                command.env(key, value);
-            }
+                    keep_or_default(
+                        "DBUS_SESSION_BUS_ADDRESS",
+                        format!("unix:path={runtime_dir}/bus"),
+                    ),
+                );
 
-            sudo_user_info = Some((uid, gid, user));
+                for var in ["SUDO_UID", "SUDO_GID", "SUDO_USER", "SUDO_COMMAND"] {
+                    command.env_remove(var);
+                }
+
+                sudo_user_info = Some((uid, gid, user));
+            }
         }
     }
 
