@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
-use nix::mount::{mount, MsFlags};
-use nix::sched::{setns, unshare, CloneFlags};
+use futures::stream::TryStreamExt;
+use netlink_packet_route::link::LinkAttribute;
+use nix::mount::{MsFlags, mount};
+use nix::sched::{CloneFlags, setns, unshare};
 use nix::sys::wait::waitpid;
-use nix::unistd::{fork, ForkResult};
+use nix::unistd::{ForkResult, fork};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -62,16 +64,63 @@ pub fn create(name: &str) -> Result<()> {
 }
 
 pub fn delete(name: &str) -> Result<()> {
-    use nix::mount::{umount2, MntFlags};
+    use nix::mount::{MntFlags, umount2};
     let target = ns_path(name);
+    if !target.exists() {
+        return Ok(());
+    }
     loop {
         match umount2(&target, MntFlags::MNT_DETACH) {
             Ok(()) => continue,
             Err(_) => break,
         }
     }
-    fs::remove_file(&target).context("remove netns file")?;
+    let _ = fs::remove_file(&target);
     Ok(())
+}
+
+/// True if a WireGuard-style interface (name prefix "wg") exists inside
+/// namespace `name`. Used as the exec-time kill switch: no such interface,
+/// no traffic leaves the namespace via `fishnet exec`.
+pub fn has_vpn_interface(name: &str) -> Result<bool> {
+    let name = name.to_string();
+    std::thread::spawn(move || -> Result<bool> {
+        enter(&name)?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let (conn, handle, _) = rtnetlink::new_connection()?;
+            tokio::spawn(conn);
+            let mut links = handle.link().get().execute();
+            while let Some(link) = links.try_next().await? {
+                for attr in &link.attributes {
+                    if let LinkAttribute::IfName(n) = attr {
+                        if n.starts_with("wg") {
+                            return anyhow::Ok(true);
+                        }
+                    }
+                }
+            }
+            anyhow::Ok(false)
+        })
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("has_vpn_interface thread panicked"))?
+}
+
+/// Ensures /etc/netns/<name>/resolv.conf exists (seeded from the host's
+/// current resolv.conf on first use), following the same convention `ip
+/// netns exec` uses. Returns its path.
+fn ensure_netns_resolv_conf(name: &str) -> Result<PathBuf> {
+    let dir = PathBuf::from("/etc/netns").join(name);
+    fs::create_dir_all(&dir).context("mkdir /etc/netns/<name>")?;
+    let path = dir.join("resolv.conf");
+    if !path.exists() {
+        let contents = fs::read("/etc/resolv.conf").unwrap_or_default();
+        fs::write(&path, contents).context("seed netns resolv.conf")?;
+    }
+    Ok(path)
 }
 
 /// Switch the current thread into namespace `name`. To route traffic through ns.
@@ -99,6 +148,7 @@ pub fn exec_in(name: &str, cmd: &[String]) -> Result<()> {
     anyhow::ensure!(!cmd.is_empty(), "no command given");
 
     let ns_file = open_fd(name)?;
+    let resolv_conf = ensure_netns_resolv_conf(name)?;
 
     let mut command = Command::new(&cmd[0]);
     command.args(&cmd[1..]);
@@ -125,7 +175,10 @@ pub fn exec_in(name: &str, cmd: &[String]) -> Result<()> {
                 ("DISPLAY", ":0".to_string()),
                 ("XAUTHORITY", format!("{home}/.Xauthority")),
                 ("WAYLAND_DISPLAY", "wayland-0".to_string()),
-                ("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={runtime_dir}/bus")),
+                (
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={runtime_dir}/bus"),
+                ),
             ];
             for (key, default) in defaults {
                 let value = std::env::var(key).unwrap_or(default);
@@ -144,6 +197,29 @@ pub fn exec_in(name: &str, cmd: &[String]) -> Result<()> {
         command.pre_exec(move || {
             setns(&ns_file, CloneFlags::CLONE_NEWNET)
                 .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+
+            // Give this process its own mount namespace and bind our
+            // per-netns resolv.conf over /etc/resolv.conf, so tools like
+            // `resolvconf` (run by a VPN client inside fishnetns) rewrite
+            // only the namespace's view of DNS, never the host's real file.
+            unshare(CloneFlags::CLONE_NEWNS)
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            mount(
+                None::<&str>,
+                "/",
+                None::<&str>,
+                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                None::<&str>,
+            )
+            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            mount(
+                Some(resolv_conf.as_path()),
+                "/etc/resolv.conf",
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
 
             if let Some((uid, gid, ref user)) = sudo_user_info {
                 let _ = nix::unistd::initgroups(

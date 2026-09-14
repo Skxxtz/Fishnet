@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use crate::netns;
 
 const VETH_HOST: &str = "vh0";
-const VETH_NS: &str = "vn0";
+pub(crate) const VETH_NS: &str = "vn0";
 
 const HOST_ADDR: Ipv4Addr = Ipv4Addr::new(10, 200, 1, 1);
 const NS_VETH_ADDR: Ipv4Addr = Ipv4Addr::new(10, 200, 1, 2);
@@ -40,6 +40,15 @@ pub async fn teardown_host_side() -> Result<()> {
         handle.link().del(idx).execute().await.context("delete vh0")?;
     }
     Ok(())
+}
+
+/// True if the host-side veth (vh0) currently exists.
+pub async fn host_link_exists() -> bool {
+    let Ok((conn, handle, _)) = rtnetlink::new_connection() else {
+        return false;
+    };
+    tokio::spawn(conn);
+    link_index(&handle, VETH_HOST).await.is_ok()
 }
 
 /// Root-namespace side: create the veth pair, address the host end (both
