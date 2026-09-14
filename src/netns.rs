@@ -7,7 +7,7 @@ use nix::sys::wait::waitpid;
 use nix::unistd::{ForkResult, fork};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const NETNS_DIR: &str = "/var/run/netns";
@@ -20,18 +20,56 @@ pub fn exists(name: &str) -> bool {
     ns_path(name).exists()
 }
 
+/// True if `path` currently shows up as a mount point in this process's mount namespace. 
+///
+/// We can't use "compare st_dev to the parent's" here: /var/run/netns is bind-mounted onto
+/// *itself*, and a self bind mount shares the exact same tmpfs superblock as its target, so its
+/// device id never changes. Reading /proc/self/mountinfo directly is the reliable way to tell.
+fn is_mountpoint(path: &Path) -> bool {
+    let Ok(canonical) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    mountinfo.lines().any(|line| {
+        // Format: ID parent-ID major:minor root mount-point options ...
+        // Field 5 (0-indexed 4) is the mount point.
+        line.split_whitespace()
+            .nth(4)
+            .is_some_and(|mp| Path::new(mp) == canonical)
+    })
+}
+
 /// Creates a persistent, bind-mounted network namespace file at /var/run/netns/<name>, using unshare(2) +
 /// mount(2).
 pub fn create(name: &str) -> Result<()> {
     fs::create_dir_all(NETNS_DIR).context("mkdir /var/run/netns")?;
 
-    let _ = mount(
-        Some(NETNS_DIR),
-        NETNS_DIR,
-        None::<&str>,
-        MsFlags::MS_BIND,
-        None::<&str>,
-    );
+    // Idempotent: 
+    // (1) bind-mount (and only once) if /var/run/netns isn't
+    // already its own mountpoint. 
+    // (2) Mark it MS_PRIVATE right after, so mount/unmount activity under it (netns files,
+    // resolv.conf binds from `exec`) doesn't propagate into the host's shared mount tree that
+    // systemd watches.
+    if !is_mountpoint(Path::new(NETNS_DIR)) {
+        mount(
+            Some(NETNS_DIR),
+            NETNS_DIR,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .context("bind mount /var/run/netns")?;
+        mount(
+            None::<&str>,
+            NETNS_DIR,
+            None::<&str>,
+            MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .context("mark /var/run/netns private")?;
+    }
 
     let target = ns_path(name);
     File::create(&target).context("create netns file")?;
@@ -67,17 +105,26 @@ pub fn create(name: &str) -> Result<()> {
 pub fn delete(name: &str) -> Result<()> {
     use nix::mount::{MntFlags, umount2};
     let target = ns_path(name);
-    if !target.exists() {
-        return Ok(());
+    if target.exists() {
+        loop {
+            match umount2(&target, MntFlags::MNT_DETACH) {
+                Ok(()) => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = fs::remove_file(&target);
     }
-    loop {
-        match umount2(&target, MntFlags::MNT_DETACH) {
+
+    // Also unwind the /var/run/netns bind mount itself. `create()` is
+    // idempotent going forward, but this clears any duplicate layers left
+    // over from before that fix (or from any other stacking), so `up`
+    // starts from a clean single mount rather than accumulating forever.
+    while is_mountpoint(Path::new(NETNS_DIR)) {
+        match umount2(NETNS_DIR, MntFlags::MNT_DETACH) {
             Ok(()) => continue,
             Err(_) => break,
         }
     }
-    // Best-effort: EBUSY/races here shouldn't fail teardown as a whole.
-    let _ = fs::remove_file(&target);
     Ok(())
 }
 
