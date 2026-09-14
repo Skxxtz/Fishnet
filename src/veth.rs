@@ -90,7 +90,7 @@ pub async fn setup_host_side(ns: &str) -> Result<()> {
 /// Runs on a dedicated OS thread: setns() only affects the calling thread,
 /// so doing this on a throwaway thread (joined before returning) keeps the
 /// caller's own thread — and everything it does afterward, like firewall
-/// setup — in the HOST namespace, not vpnns.
+/// setup — in the HOST namespace, not fishnetns.
 pub fn setup_ns_side(ns: &str) -> Result<()> {
     let ns = ns.to_string();
     std::thread::spawn(move || -> Result<()> {

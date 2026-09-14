@@ -14,6 +14,10 @@ fn ns_path(name: &str) -> PathBuf {
     PathBuf::from(NETNS_DIR).join(name)
 }
 
+pub fn exists(name: &str) -> bool {
+    ns_path(name).exists()
+}
+
 /// Creates a persistent, bind-mounted network namespace file at /var/run/netns/<name>, using unshare(2) +
 /// mount(2).
 pub fn create(name: &str) -> Result<()> {

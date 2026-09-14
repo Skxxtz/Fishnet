@@ -67,7 +67,7 @@ fn iface_bytes(name: &str) -> Vec<u8> {
 /// - forward chain (Firewall): decides which package the host is willling to relay between
 ///   interfaces. `Drop`: nothing gets forwarded. Only two excelptions: 1. `out_rule`: traffic to
 ///   uplink is allowed (outbound traffic), 2. `in_rule`: traffic from the uplink is allowed only if
-///   its a reply to somthing vpnns has already sent. 
+///   its a reply to somthing fishnetns has already sent. 
 /// - postrouting chain (NAT): handles address translation, policy `Accept`
 ///
 /// **Masquerade** map internal ip to hosts own real IP. Masquerade rewrites the source address to
@@ -92,7 +92,7 @@ pub fn setup_nat_and_forward(
     forward.set_policy(ChainPolicy::Drop);
     batch.add(&forward, MsgType::Add);
 
-    // vpnns -> uplink: allowed unconditionally. Interface-name matching,
+    // fishnetns -> uplink: allowed unconditionally. Interface-name matching,
     // not protocol-specific, so this single rule covers both v4 and v6.
     let out_rule = Rule::new(&forward)?
         .with_expr(Meta::new(MetaType::IifName))
@@ -102,7 +102,7 @@ pub fn setup_nat_and_forward(
         .with_expr(Immediate::new_verdict(VerdictKind::Accept));
     batch.add(&out_rule, MsgType::Add);
 
-    // uplink -> vpnns: only established/related reply traffic. Also
+    // uplink -> fishnetns: only established/related reply traffic. Also
     // protocol-agnostic — conntrack state doesn't care about v4 vs v6.
     let state_mask = (ConnTrackState::ESTABLISHED | ConnTrackState::RELATED)
         .bits()
