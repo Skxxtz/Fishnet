@@ -1,0 +1,16 @@
+[package]
+name = "fishnet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+boringtun = "0.7.1"
+clap = { version = "4.6.1", features = ["derive"] }
+rtnetlink = "0.14"
+netlink-packet-route = "0.19"
+futures = "0.3"
+tokio = { version = "1.53.1", features = ["full"] }
+nix = { version = "0.31.3", features = ["sched", "mount", "fs", "process", "user"] }
+anyhow = "1.0.104"
+rustables = "0.8.8"
+libc = "0.2"
