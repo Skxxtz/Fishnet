@@ -8,6 +8,8 @@ use rustables::expr::{
 };
 use rustables::{Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, ProtocolFamily, Rule, Table};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 // Identify default network interface route that connects to the internet. Instead of relying on
 // `eth0` or `wlan0`. 
@@ -47,12 +49,58 @@ pub async fn detect_uplink() -> Result<String> {
     anyhow::bail!("no default route found — can't auto-detect uplink interface")
 }
 
-/// Enable IPv4 AND IPv6 forwarding
+const STATE_DIR: &str = "/run/fishnet";
+const SYSCTL_STATE: &str = "/run/fishnet/sysctl.saved";
+const FORWARD_SYSCTLS: [&str; 2] = [
+    "/proc/sys/net/ipv4/ip_forward",
+    "/proc/sys/net/ipv6/conf/all/forwarding",
+];
+
+/// Enable IPv4 AND IPv6 forwarding. The original values are saved under /run/fishnet (tmpfs, so
+/// a reboot clears it together with the sysctls) and put back by `restore_ip_forward` on `down`.
 pub fn enable_ip_forward() -> Result<()> {
-    std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").context("enable ipv4 forward")?;
-    std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", b"1")
-        .context("enable ipv6 forward")?;
+    // Save only once: if an earlier run crashed before `down`, the file still holds the true
+    // originals and must not be overwritten with our own "1".
+    if !Path::new(SYSCTL_STATE).exists() {
+        let mut saved = String::new();
+        for path in FORWARD_SYSCTLS {
+            let old = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+            saved.push_str(&format!("{path}={}\n", old.trim()));
+        }
+        std::fs::create_dir_all(STATE_DIR).context("mkdir /run/fishnet")?;
+        std::fs::set_permissions(STATE_DIR, std::fs::Permissions::from_mode(0o700))
+            .context("chmod /run/fishnet")?;
+        std::fs::write(SYSCTL_STATE, saved).context("save sysctl state")?;
+    }
+    for path in FORWARD_SYSCTLS {
+        std::fs::write(path, b"1").with_context(|| format!("enable {path}"))?;
+    }
     Ok(())
+}
+
+/// Put the forwarding sysctls back to what they were before `enable_ip_forward`. No-op if
+/// nothing was saved. Only ever writes to the known sysctl paths, whatever the file says.
+pub fn restore_ip_forward() -> Result<()> {
+    let Ok(saved) = std::fs::read_to_string(SYSCTL_STATE) else {
+        return Ok(());
+    };
+    let mut failure = None;
+    for line in saved.lines() {
+        if let Some((path, val)) = line.split_once('=') {
+            if FORWARD_SYSCTLS.contains(&path) && matches!(val, "0" | "1") {
+                if let Err(e) = std::fs::write(path, val) {
+                    failure = Some(anyhow::Error::new(e).context(format!("restore {path}")));
+                }
+            }
+        }
+    }
+    match failure {
+        None => {
+            let _ = std::fs::remove_file(SYSCTL_STATE);
+            Ok(())
+        }
+        Some(e) => Err(e),
+    }
 }
 
 const TABLE_NAME: &str = "fishnet";
@@ -168,11 +216,15 @@ pub fn setup_nat_and_forward(
     Ok(())
 }
 
-/// Idempotent teardown, called from `down`.
+/// Idempotent teardown, called from `down`: removes the nft table and restores the sysctls.
 pub fn teardown() -> Result<()> {
     let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME);
     let mut batch = Batch::new();
     batch.add(&table, MsgType::Del);
     let _ = batch.send();
+
+    if let Err(e) = restore_ip_forward() {
+        eprintln!("warning: couldn't restore ip forwarding sysctls: {e:#}");
+    }
     Ok(())
 }

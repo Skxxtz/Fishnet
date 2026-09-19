@@ -8,9 +8,11 @@ use nix::unistd::{ForkResult, Gid, Uid, User, fork, getgrouplist, setgid, setgro
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const NETNS_DIR: &str = "/var/run/netns";
 
@@ -101,6 +103,60 @@ pub fn create(name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// PIDs (other than ours) that live in network namespace `name`.
+///
+/// Same trick as `ip netns pids`: a namespace is identified by the (st_dev, st_ino) of its nsfs
+/// file, so the bind-mounted /var/run/netns/<name> and /proc/<pid>/ns/net match iff they are the
+/// same namespace. Catches detached and double-forked processes, and needs no cgroups, so it works
+/// on every distro with or without systemd.
+fn pids_in_netns(name: &str) -> Vec<i32> {
+    let Ok(target) = fs::metadata(ns_path(name)) else {
+        return Vec::new();
+    };
+    let me = std::process::id() as i32;
+    let Ok(proc_dir) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    proc_dir
+        .filter_map(|entry| {
+            let pid: i32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            if pid == me {
+                return None;
+            }
+            let m = fs::metadata(format!("/proc/{pid}/ns/net")).ok()?;
+            (m.dev() == target.dev() && m.ino() == target.ino()).then_some(pid)
+        })
+        .collect()
+}
+
+/// Kill everything still running inside namespace `name` (detached apps, the VPN client, ...).
+/// SIGTERM first, then SIGKILL sweeps, repeated to catch anything forked in between.
+pub fn kill_all(name: &str) {
+    let signal = |pids: &[i32], sig: libc::c_int| {
+        for &pid in pids {
+            // SAFETY: plain kill(2); a stale pid just yields ESRCH.
+            unsafe { libc::kill(pid, sig) };
+        }
+    };
+
+    let pids = pids_in_netns(name);
+    if !pids.is_empty() {
+        signal(&pids, libc::SIGTERM);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !pids_in_netns(name).is_empty() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    for _ in 0..5 {
+        let pids = pids_in_netns(name);
+        if pids.is_empty() {
+            return;
+        }
+        signal(&pids, libc::SIGKILL);
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Idempotent: a namespace that's already gone is success, not an error.
@@ -249,8 +305,51 @@ fn sudo_caller() -> Result<Caller> {
     Ok(Caller { user, gid, groups })
 }
 
-/// Fix the vars sudo forces to root's identity (HOME/USER/LOGNAME/MAIL), restore the
-/// desktop-session vars sudo's env_reset strips, and drop sudo's own bookkeeping vars.
+/// Variables that survive into spawned commands. Everything else (LD_PRELOAD, LD_LIBRARY_PATH,
+/// PYTHONPATH, BASH_ENV, sudo's SUDO_* bookkeeping, ...) is dropped. LC_* is allowed by prefix.
+const ENV_ALLOW: &[&str] = &["TERM", "COLORTERM", "LANG", "LANGUAGE", "TZ"];
+
+/// Start from an empty environment and re-add only allowlisted variables plus a cleaned PATH.
+fn sanitize_env(command: &mut Command, as_root: bool) {
+    let keep: Vec<_> = std::env::vars_os()
+        .filter(|(k, _)| {
+            k.to_str()
+                .is_some_and(|k| ENV_ALLOW.contains(&k) || k.starts_with("LC_"))
+        })
+        .collect();
+    command.env_clear().envs(keep).env("PATH", clean_path(as_root));
+}
+
+/// PATH entries must be absolute (no "" or "." meaning the cwd). For a command that stays root,
+/// also drop directories that aren't root-owned or that others can write to, so a binary planted
+/// in a user-controlled directory can't run as root. (Doesn't check ancestor directories.)
+fn clean_path(as_root: bool) -> String {
+    let raw = std::env::var("PATH").unwrap_or_default();
+    let trusted = |dir: &str| {
+        dir.starts_with('/')
+            && (!as_root
+                || fs::metadata(dir)
+                    .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0))
+    };
+    let dirs: Vec<&str> = raw.split(':').filter(|d| trusted(d)).collect();
+    if dirs.is_empty() {
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+    } else {
+        dirs.join(":")
+    }
+}
+
+fn apply_root_env(command: &mut Command) {
+    let home = User::from_uid(Uid::from_raw(0))
+        .ok()
+        .flatten()
+        .map(|u| u.dir.display().to_string())
+        .unwrap_or_else(|| "/root".to_string());
+    command.env("HOME", home).env("USER", "root").env("LOGNAME", "root");
+}
+
+/// Set the identity vars (HOME/USER/LOGNAME/SHELL/MAIL) to the caller's and restore the
+/// desktop-session vars sudo's env_reset strips. Runs after `sanitize_env`.
 fn apply_caller_env(command: &mut Command, c: &Caller) {
     let uid = c.user.uid.as_raw();
     let home = c.user.dir.display().to_string();
@@ -259,6 +358,7 @@ fn apply_caller_env(command: &mut Command, c: &Caller) {
     command.env("HOME", &home);
     command.env("USER", &c.user.name);
     command.env("LOGNAME", &c.user.name);
+    command.env("SHELL", &c.user.shell);
     if std::env::var_os("MAIL").is_some() {
         command.env("MAIL", format!("/var/mail/{}", c.user.name));
     }
@@ -287,10 +387,43 @@ fn apply_caller_env(command: &mut Command, c: &Caller) {
             format!("unix:path={runtime_dir}/bus"),
         ),
     );
+}
 
-    for var in ["SUDO_UID", "SUDO_GID", "SUDO_USER", "SUDO_COMMAND"] {
-        command.env_remove(var);
+/// Empty the capability bounding set so the command can never regain a capability through exec.
+/// Needs CAP_SETPCAP, so it must run BEFORE setuid. Only plain prctl calls (no allocation), as
+/// required between fork and exec.
+fn drop_bounding_set() -> io::Result<()> {
+    for cap in 0..64 as libc::c_ulong {
+        // SAFETY: plain prctl(2) syscall.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } == -1 {
+            let err = io::Error::last_os_error();
+            // EINVAL: past the last capability this kernel knows about. Done.
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                break;
+            }
+            return Err(err);
+        }
     }
+    Ok(())
+}
+
+/// After the uid switch: clear ambient caps, set no_new_privs (setuid/setgid/file-capability
+/// binaries like `sudo` can no longer raise privileges), and verify root can't be regained.
+fn lock_down() -> io::Result<()> {
+    // SAFETY: plain syscalls, no allocation.
+    unsafe {
+        if libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong, 0, 0, 0) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // Paranoia: setuid(2) as root sets real, effective AND saved uid, so this must now fail.
+        if libc::setuid(0) == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+    }
+    Ok(())
 }
 
 /// Run `cmd` inside namespace `name`. Returns the exit code (always 0 when detached).
@@ -302,6 +435,7 @@ pub fn exec_in(name: &str, cmd: &[String], opts: ExecOpts) -> Result<i32> {
 
     let mut command = Command::new(&cmd[0]);
     command.args(&cmd[1..]);
+    sanitize_env(&mut command, opts.run_as == RunAs::Root);
 
     let caller = match opts.run_as {
         RunAs::Caller => {
@@ -309,7 +443,10 @@ pub fn exec_in(name: &str, cmd: &[String], opts: ExecOpts) -> Result<i32> {
             apply_caller_env(&mut command, &c);
             Some(c)
         }
-        RunAs::Root => None,
+        RunAs::Root => {
+            apply_root_env(&mut command);
+            None
+        }
     };
 
     let detach = opts.detach;
@@ -322,7 +459,8 @@ pub fn exec_in(name: &str, cmd: &[String], opts: ExecOpts) -> Result<i32> {
 
     // SAFETY: pre_exec runs in the forked child between fork() and exec(). Everything it needs
     // (fd, paths, uid/gid, group list) was computed above, so it only makes plain syscalls.
-    // Order matters: setns and the mounts need root, so the uid/gid drop comes last.
+    // Order matters: setns, the mounts and the bounding-set drop need root, so the uid/gid drop
+    // comes after them and the lock-down after that.
     unsafe {
         command.pre_exec(move || {
             let os = io::Error::from;
@@ -351,9 +489,11 @@ pub fn exec_in(name: &str, cmd: &[String], opts: ExecOpts) -> Result<i32> {
             .map_err(os)?;
 
             if let Some(c) = &caller {
+                drop_bounding_set()?;
                 setgroups(&c.groups).map_err(os)?;
                 setgid(c.gid).map_err(os)?;
                 setuid(c.user.uid).map_err(os)?;
+                lock_down()?;
             }
 
             // Detach last, so setup failures above are reported to the parent through

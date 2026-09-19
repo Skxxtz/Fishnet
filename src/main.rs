@@ -39,6 +39,9 @@ enum Cmd {
 /// Idempotent teardown, shared by `down` and by `up` when re-creating a
 /// stale namespace.
 fn down() -> Result<()> {
+    // Kill everything still running in the namespace first (detached apps, the VPN client),
+    // so nothing keeps talking while the plumbing is removed.
+    netns::kill_all(NS);
     let _ = firewall::teardown();
     let rt = tokio::runtime::Runtime::new()?;
     let _ = rt.block_on(veth::teardown_host_side());
