@@ -159,6 +159,54 @@ pub fn kill_all(name: &str) {
     }
 }
 
+pub struct NsProcess {
+    pub pid: i32,
+    pub ppid: i32,
+    pub user: String,
+    pub cmd: String,
+}
+
+/// Processes currently running inside namespace `name`, sorted by PID.
+pub fn processes(name: &str) -> Vec<NsProcess> {
+    let mut list: Vec<NsProcess> = pids_in_netns(name)
+        .into_iter()
+        .filter_map(|pid| {
+            let uid = fs::metadata(format!("/proc/{pid}")).ok()?.uid();
+            let user = User::from_uid(Uid::from_raw(uid))
+                .ok()
+                .flatten()
+                .map(|u| u.name)
+                .unwrap_or_else(|| uid.to_string());
+            let ppid: i32 = fs::read_to_string(format!("/proc/{pid}/status"))
+                .ok()?
+                .lines()
+                .find_map(|l| l.strip_prefix("PPid:"))?
+                .trim()
+                .parse()
+                .ok()?;
+            // cmdline is NUL-separated; fall back to the short name if it's empty.
+            let cmd = fs::read(format!("/proc/{pid}/cmdline"))
+                .ok()
+                .map(|b| {
+                    b.split(|&c| c == 0)
+                        .filter(|a| !a.is_empty())
+                        .map(|a| String::from_utf8_lossy(a).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    fs::read_to_string(format!("/proc/{pid}/comm"))
+                        .ok()
+                        .map(|s| format!("[{}]", s.trim()))
+                })?;
+            Some(NsProcess { pid, ppid, user, cmd })
+        })
+        .collect();
+    list.sort_by_key(|p| p.pid);
+    list
+}
+
 /// Idempotent: a namespace that's already gone is success, not an error.
 pub fn delete(name: &str) -> Result<()> {
     use nix::mount::{MntFlags, umount2};

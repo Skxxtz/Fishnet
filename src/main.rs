@@ -33,6 +33,12 @@ enum Cmd {
         command: Vec<String>,
     },
     Status,
+    /// List processes running inside the namespace.
+    Ps {
+        /// Don't truncate command lines to the terminal width.
+        #[arg(short, long)]
+        full: bool,
+    },
     Down,
 }
 
@@ -46,6 +52,21 @@ fn down() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let _ = rt.block_on(veth::teardown_host_side());
     netns::delete(NS)
+}
+
+/// Width of the terminal on stdout, or None when stdout isn't a terminal.
+fn term_width() -> Option<usize> {
+    // SAFETY: TIOCGWINSZ only writes into the winsize struct we pass.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
+    (ok && ws.ws_col > 0).then_some(ws.ws_col as usize)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
 }
 
 fn exit_with(code: i32) -> Result<()> {
@@ -139,6 +160,8 @@ fn main() -> Result<()> {
                 }
             );
 
+            println!("processes: {}", netns::processes(NS).len());
+
             if vpn_up {
                 // Quick reachability check from inside the namespace —
                 // reuses the exact same exec path as normal commands, just
@@ -159,6 +182,28 @@ fn main() -> Result<()> {
                     Ok(code) => println!("(reachability check failed: curl exited with {code})"),
                     Err(e) => println!("(couldn't reach the internet from inside fishnetns: {e})"),
                 }
+            }
+            Ok(())
+        }
+        Cmd::Ps { full } => {
+            anyhow::ensure!(
+                netns::exists(NS),
+                "fishnetns is down — run `fishnet up` first"
+            );
+            let procs = netns::processes(NS);
+            if procs.is_empty() {
+                println!("no processes in {NS}.");
+                return Ok(());
+            }
+            // Columns before COMMAND take 31 chars. Truncate only on a terminal (not when piped).
+            let cmd_width = if full { None } else { term_width().map(|w| w.saturating_sub(31).max(20)) };
+            println!("{:>7}  {:>7}  {:<12} COMMAND", "PID", "PPID", "USER");
+            for p in procs {
+                let cmd = match cmd_width {
+                    Some(w) => truncate(&p.cmd, w),
+                    None => p.cmd,
+                };
+                println!("{:>7}  {:>7}  {:<12} {}", p.pid, p.ppid, p.user, cmd);
             }
             Ok(())
         }
