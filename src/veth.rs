@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 
 use crate::netns;
 
-const VETH_HOST: &str = "vh0";
+pub(crate) const VETH_HOST: &str = "vh0";
 pub(crate) const VETH_NS: &str = "vn0";
 
 const HOST_ADDR: Ipv4Addr = Ipv4Addr::new(10, 200, 1, 1);

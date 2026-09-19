@@ -68,7 +68,7 @@ fn main() -> Result<()> {
             let uplink = rt.block_on(firewall::detect_uplink())?;
             firewall::enable_ip_forward()?;
             firewall::setup_nat_and_forward(
-                "vh0",
+                veth::VETH_HOST,
                 &uplink,
                 Ipv4Addr::new(10, 200, 1, 0),
                 24,
