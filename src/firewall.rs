@@ -86,13 +86,11 @@ pub fn restore_ip_forward() -> Result<()> {
     };
     let mut failure = None;
     for line in saved.lines() {
-        if let Some((path, val)) = line.split_once('=') {
-            if FORWARD_SYSCTLS.contains(&path) && matches!(val, "0" | "1") {
-                if let Err(e) = std::fs::write(path, val) {
+        if let Some((path, val)) = line.split_once('=')
+            && FORWARD_SYSCTLS.contains(&path) && matches!(val, "0" | "1")
+                && let Err(e) = std::fs::write(path, val) {
                     failure = Some(anyhow::Error::new(e).context(format!("restore {path}")));
                 }
-            }
-        }
     }
     match failure {
         None => {

@@ -212,12 +212,7 @@ pub fn delete(name: &str) -> Result<()> {
     use nix::mount::{MntFlags, umount2};
     let target = ns_path(name);
     if target.exists() {
-        loop {
-            match umount2(&target, MntFlags::MNT_DETACH) {
-                Ok(()) => continue,
-                Err(_) => break,
-            }
-        }
+        while umount2(&target, MntFlags::MNT_DETACH).is_ok() {}
         let _ = fs::remove_file(&target);
     }
 
@@ -225,12 +220,7 @@ pub fn delete(name: &str) -> Result<()> {
     // idempotent going forward, but this clears any duplicate layers left
     // over from before that fix (or from any other stacking), so `up`
     // starts from a clean single mount rather than accumulating forever.
-    while is_mountpoint(Path::new(NETNS_DIR)) {
-        match umount2(NETNS_DIR, MntFlags::MNT_DETACH) {
-            Ok(()) => continue,
-            Err(_) => break,
-        }
-    }
+    while is_mountpoint(Path::new(NETNS_DIR)) && umount2(NETNS_DIR, MntFlags::MNT_DETACH).is_ok() {}
     Ok(())
 }
 
@@ -250,11 +240,10 @@ pub fn has_vpn_interface(name: &str) -> Result<bool> {
             let mut links = handle.link().get().execute();
             while let Some(link) = links.try_next().await? {
                 for attr in &link.attributes {
-                    if let LinkAttribute::IfName(n) = attr {
-                        if n.starts_with("wg") {
+                    if let LinkAttribute::IfName(n) = attr
+                        && n.starts_with("wg") {
                             return anyhow::Ok(true);
                         }
-                    }
                 }
             }
             anyhow::Ok(false)
