@@ -4,6 +4,7 @@ mod veth;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use netns::ExecOpts;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 const NS: &str = "fishnetns";
@@ -17,14 +18,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Up,
-    /// Run a command without the VPN kill switch — for the VPN client's
-    /// own connect command, which has to reach the internet before any
-    /// tunnel exists.
+    /// Run a command as root inside the namespace, without the VPN kill switch — for the VPN
+    /// client's own connect command, which has to reach the internet before any tunnel exists.
     Connect {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// Run a command as the invoking user inside the namespace (requires an active VPN).
     Exec {
+        /// Detach from the terminal and return immediately (for GUI apps / launchers).
+        #[arg(short, long)]
+        detach: bool,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -39,6 +43,13 @@ fn down() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let _ = rt.block_on(veth::teardown_host_side());
     netns::delete(NS)
+}
+
+fn exit_with(code: i32) -> Result<()> {
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -75,9 +86,9 @@ fn main() -> Result<()> {
                 netns::exists(NS),
                 "fishnetns is down — run `fishnet up` first"
             );
-            netns::exec_in(NS, &command)
+            exit_with(netns::exec_in(NS, &command, ExecOpts::root())?)
         }
-        Cmd::Exec { command } => {
+        Cmd::Exec { detach, command } => {
             anyhow::ensure!(
                 netns::exists(NS),
                 "fishnetns is down — run `fishnet up` first"
@@ -90,7 +101,7 @@ fn main() -> Result<()> {
                     command.join(" ")
                 );
             }
-            netns::exec_in(NS, &command)
+            exit_with(netns::exec_in(NS, &command, ExecOpts::caller(detach))?)
         }
         Cmd::Status => {
             if !netns::exists(NS) {
@@ -139,8 +150,10 @@ fn main() -> Result<()> {
                         "-4".into(),
                         "ifconfig.me".into(),
                     ],
+                    ExecOpts::caller(false),
                 ) {
-                    Ok(()) => eprintln!(""),
+                    Ok(0) => eprintln!(),
+                    Ok(code) => println!("(reachability check failed: curl exited with {code})"),
                     Err(e) => println!("(couldn't reach the internet from inside fishnetns: {e})"),
                 }
             }

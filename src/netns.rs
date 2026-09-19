@@ -4,11 +4,13 @@ use netlink_packet_route::link::LinkAttribute;
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, setns, unshare};
 use nix::sys::wait::waitpid;
-use nix::unistd::{ForkResult, fork};
+use nix::unistd::{ForkResult, Gid, Uid, User, fork, getgrouplist, setgid, setgroups, setuid};
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::process::CommandExt;
+use std::io;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const NETNS_DIR: &str = "/var/run/netns";
 
@@ -20,7 +22,7 @@ pub fn exists(name: &str) -> bool {
     ns_path(name).exists()
 }
 
-/// True if `path` currently shows up as a mount point in this process's mount namespace. 
+/// True if `path` currently shows up as a mount point in this process's mount namespace.
 ///
 /// We can't use "compare st_dev to the parent's" here: /var/run/netns is bind-mounted onto
 /// *itself*, and a self bind mount shares the exact same tmpfs superblock as its target, so its
@@ -46,9 +48,9 @@ fn is_mountpoint(path: &Path) -> bool {
 pub fn create(name: &str) -> Result<()> {
     fs::create_dir_all(NETNS_DIR).context("mkdir /var/run/netns")?;
 
-    // Idempotent: 
+    // Idempotent:
     // (1) bind-mount (and only once) if /var/run/netns isn't
-    // already its own mountpoint. 
+    // already its own mountpoint.
     // (2) Mark it MS_PRIVATE right after, so mount/unmount activity under it (netns files,
     // resolv.conf binds from `exec`) doesn't propagate into the host's shared mount tree that
     // systemd watches.
@@ -189,11 +191,110 @@ pub fn open_fd(name: &str) -> Result<File> {
         .context("open netns file")
 }
 
-/// Spawn `cmd` as a normal child process, joined to namespace `name`, and
-/// — if this process was invoked via sudo — running as the real invoking
-/// user with a properly reconstructed desktop environment, rather than
-/// sudo's sanitized one.
-pub fn exec_in(name: &str, cmd: &[String]) -> Result<()> {
+/// Who the spawned command runs as. Decided by the subcommand, never by argv.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RunAs {
+    /// Stay root. Only for `connect`: the VPN client must configure interfaces and routes.
+    Root,
+    /// Drop to the user who invoked sudo. For `exec` (and `status`): apps never keep root.
+    Caller,
+}
+
+#[derive(Clone, Copy)]
+pub struct ExecOpts {
+    pub run_as: RunAs,
+    /// Double-fork + setsid + null stdio: the command outlives us and doesn't hold our
+    /// terminal. For GUI apps / launchers. Foreground (default) keeps stdio and exit code.
+    pub detach: bool,
+}
+
+impl ExecOpts {
+    pub fn root() -> Self {
+        Self { run_as: RunAs::Root, detach: false }
+    }
+    pub fn caller(detach: bool) -> Self {
+        Self { run_as: RunAs::Caller, detach }
+    }
+}
+
+/// The invoking user, fully resolved BEFORE fork so that `pre_exec` only has to make plain
+/// syscalls (no allocation, no NSS lookups, which aren't async-signal-safe).
+struct Caller {
+    user: User,
+    gid: Gid,
+    groups: Vec<Gid>,
+}
+
+fn sudo_caller() -> Result<Caller> {
+    let uid: u32 = std::env::var("SUDO_UID")
+        .context("SUDO_UID not set — run this via `sudo` from your own user account")?
+        .parse()
+        .context("parse SUDO_UID")?;
+    let gid: u32 = std::env::var("SUDO_GID")
+        .context("SUDO_GID not set")?
+        .parse()
+        .context("parse SUDO_GID")?;
+    // Fail closed: never "drop" to root, and never silently stay root.
+    anyhow::ensure!(
+        uid != 0,
+        "refusing to run this command as root; invoke sudo from a normal user account"
+    );
+
+    let user = User::from_uid(Uid::from_raw(uid))
+        .context("look up SUDO_UID")?
+        .with_context(|| format!("no passwd entry for uid {uid}"))?;
+    let gid = Gid::from_raw(gid);
+    let name = CString::new(user.name.as_str()).context("user name contains NUL")?;
+    let groups = getgrouplist(&name, gid).context("getgrouplist")?;
+    Ok(Caller { user, gid, groups })
+}
+
+/// Fix the vars sudo forces to root's identity (HOME/USER/LOGNAME/MAIL), restore the
+/// desktop-session vars sudo's env_reset strips, and drop sudo's own bookkeeping vars.
+fn apply_caller_env(command: &mut Command, c: &Caller) {
+    let uid = c.user.uid.as_raw();
+    let home = c.user.dir.display().to_string();
+    let runtime_dir = format!("/run/user/{uid}");
+
+    command.env("HOME", &home);
+    command.env("USER", &c.user.name);
+    command.env("LOGNAME", &c.user.name);
+    if std::env::var_os("MAIL").is_some() {
+        command.env("MAIL", format!("/var/mail/{}", c.user.name));
+    }
+
+    // sudo's env_reset strips these before we ever see them, so "inherited" is
+    // indistinguishable from "unset" — use the inherited value if present (env_keep,
+    // `sudo -E`), otherwise the normal per-user default.
+    let keep_or_default = |key: &str, default: String| std::env::var(key).unwrap_or(default);
+    command.env(
+        "XDG_RUNTIME_DIR",
+        keep_or_default("XDG_RUNTIME_DIR", runtime_dir.clone()),
+    );
+    command.env("DISPLAY", keep_or_default("DISPLAY", ":0".to_string()));
+    command.env(
+        "XAUTHORITY",
+        keep_or_default("XAUTHORITY", format!("{home}/.Xauthority")),
+    );
+    command.env(
+        "WAYLAND_DISPLAY",
+        keep_or_default("WAYLAND_DISPLAY", "wayland-0".to_string()),
+    );
+    command.env(
+        "DBUS_SESSION_BUS_ADDRESS",
+        keep_or_default(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={runtime_dir}/bus"),
+        ),
+    );
+
+    for var in ["SUDO_UID", "SUDO_GID", "SUDO_USER", "SUDO_COMMAND"] {
+        command.env_remove(var);
+    }
+}
+
+/// Run `cmd` inside namespace `name`. Returns the exit code (always 0 when detached).
+pub fn exec_in(name: &str, cmd: &[String], opts: ExecOpts) -> Result<i32> {
     anyhow::ensure!(!cmd.is_empty(), "no command given");
 
     let ns_file = open_fd(name)?;
@@ -201,81 +302,37 @@ pub fn exec_in(name: &str, cmd: &[String]) -> Result<()> {
 
     let mut command = Command::new(&cmd[0]);
     command.args(&cmd[1..]);
-    let cmd_needs_root = cmd[0] == "sudo";
 
-    // (1) fix the vars sudo forces to root's identity (HOME/USER/LOGNAME, MAIL) and the
-    // desktop-session vars sudo's env_reset strips (DISPLAY/XAUTHORITY/WAYLAND_DISPLAY/
-    // DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR), and (2) drop sudo's own bookkeeping vars so they
-    // don't leak into the child.
-    let mut sudo_user_info: Option<(u32, u32, nix::unistd::User)> = None;
-    if !cmd_needs_root {
-        if let (Ok(uid_str), Ok(gid_str)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
-            let uid: u32 = uid_str.parse().context("parse SUDO_UID")?;
-            let gid: u32 = gid_str.parse().context("parse SUDO_GID")?;
-
-            if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
-                let home = user.dir.display().to_string();
-                let runtime_dir = format!("/run/user/{uid}");
-
-                command.env("HOME", &home);
-                command.env("USER", &user.name);
-                command.env("LOGNAME", &user.name);
-                if std::env::var_os("MAIL").is_some() {
-                    command.env("MAIL", format!("/var/mail/{}", user.name));
-                }
-
-                // sudo's env_reset strips these before we ever see them, so
-                // "inherited" is indistinguishable from "unset" here — use
-                // the inherited value if present (e.g. env_keep in sudoers,
-                // or `sudo -E`), otherwise fall back to the normal per-user
-                // default so GUI apps still find a display/session bus.
-                let keep_or_default =
-                    |key: &str, default: String| std::env::var(key).unwrap_or(default);
-                command.env(
-                    "XDG_RUNTIME_DIR",
-                    keep_or_default("XDG_RUNTIME_DIR", runtime_dir.clone()),
-                );
-                command.env("DISPLAY", keep_or_default("DISPLAY", ":0".to_string()));
-                command.env(
-                    "XAUTHORITY",
-                    keep_or_default("XAUTHORITY", format!("{home}/.Xauthority")),
-                );
-                command.env(
-                    "WAYLAND_DISPLAY",
-                    keep_or_default("WAYLAND_DISPLAY", "wayland-0".to_string()),
-                );
-                command.env(
-                    "DBUS_SESSION_BUS_ADDRESS",
-                    keep_or_default(
-                        "DBUS_SESSION_BUS_ADDRESS",
-                        format!("unix:path={runtime_dir}/bus"),
-                    ),
-                );
-
-                for var in ["SUDO_UID", "SUDO_GID", "SUDO_USER", "SUDO_COMMAND"] {
-                    command.env_remove(var);
-                }
-
-                sudo_user_info = Some((uid, gid, user));
-            }
+    let caller = match opts.run_as {
+        RunAs::Caller => {
+            let c = sudo_caller()?;
+            apply_caller_env(&mut command, &c);
+            Some(c)
         }
+        RunAs::Root => None,
+    };
+
+    let detach = opts.detach;
+    if detach {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
     }
 
-    // SAFETY: pre_exec runs in the forked child between fork() and exec(), still fully root at this
-    // point. We do setns() FIRST, only THEN drop to the target uid/gid ourselves — doing both steps
-    // explicitly here, in this order, rather than mixing our pre_exec with Command's separate
-    // built-in .uid()/.gid() machinery, removes any ambiguity about which happens first.
+    // SAFETY: pre_exec runs in the forked child between fork() and exec(). Everything it needs
+    // (fd, paths, uid/gid, group list) was computed above, so it only makes plain syscalls.
+    // Order matters: setns and the mounts need root, so the uid/gid drop comes last.
     unsafe {
         command.pre_exec(move || {
-            setns(&ns_file, CloneFlags::CLONE_NEWNET)
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            let os = io::Error::from;
 
-            // Give this process its own mount namespace and bind our
-            // per-netns resolv.conf over /etc/resolv.conf, so tools like
-            // `resolvconf` (run by a VPN client inside fishnetns) rewrite
-            // only the namespace's view of DNS, never the host's real file.
-            unshare(CloneFlags::CLONE_NEWNS)
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            setns(&ns_file, CloneFlags::CLONE_NEWNET).map_err(os)?;
+
+            // Private mount namespace with our per-netns resolv.conf bound over
+            // /etc/resolv.conf, so `resolvconf` (run by a VPN client inside the namespace)
+            // rewrites only the namespace's view of DNS, never the host's real file.
+            unshare(CloneFlags::CLONE_NEWNS).map_err(os)?;
             mount(
                 None::<&str>,
                 "/",
@@ -283,7 +340,7 @@ pub fn exec_in(name: &str, cmd: &[String]) -> Result<()> {
                 MsFlags::MS_REC | MsFlags::MS_PRIVATE,
                 None::<&str>,
             )
-            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            .map_err(os)?;
             mount(
                 Some(resolv_conf.as_path()),
                 "/etc/resolv.conf",
@@ -291,23 +348,38 @@ pub fn exec_in(name: &str, cmd: &[String]) -> Result<()> {
                 MsFlags::MS_BIND,
                 None::<&str>,
             )
-            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            .map_err(os)?;
 
-            if let Some((uid, gid, ref user)) = sudo_user_info {
-                let _ = nix::unistd::initgroups(
-                    &std::ffi::CString::new(user.name.as_str()).unwrap(),
-                    nix::unistd::Gid::from_raw(gid),
-                );
-                nix::unistd::setgid(nix::unistd::Gid::from_raw(gid))
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                nix::unistd::setuid(nix::unistd::Uid::from_raw(uid))
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            if let Some(c) = &caller {
+                setgroups(&c.groups).map_err(os)?;
+                setgid(c.gid).map_err(os)?;
+                setuid(c.user.uid).map_err(os)?;
+            }
+
+            // Detach last, so setup failures above are reported to the parent through
+            // std's exec-error pipe. The intermediate child exits immediately, the
+            // grandchild is adopted by PID 1 and has no controlling terminal.
+            if detach {
+                match libc::fork() {
+                    -1 => return Err(io::Error::last_os_error()),
+                    0 => {
+                        libc::setsid();
+                    }
+                    _ => libc::_exit(0),
+                }
             }
             Ok(())
         });
     }
 
+    // Detached: this waits only for the intermediate child (exit 0), and still returns
+    // spawn/exec errors from the grandchild via the pipe.
     let status = command.status().context("spawn command")?;
-    anyhow::ensure!(status.success(), "command exited with {status}");
-    Ok(())
+    if detach {
+        return Ok(0);
+    }
+    Ok(status
+        .code()
+        .or_else(|| status.signal().map(|s| 128 + s))
+        .unwrap_or(1))
 }
